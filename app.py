@@ -1,221 +1,233 @@
-import streamlit as st
+
+"""
+app.py – Streamlit RAG PDF assistant with three modes:
+1. Chat  – conversational QA
+2. Q&A   – one-shot question & answer
+3. Quiz  – auto-generates 20 Q-and-A quiz pairs
+
+Uses:
+• Groq Llama-3.3-70B (API key loaded from .env)
+• SentenceTransformers embeddings (all-MiniLM-L6-v2)
+• Chroma for vector storage
+"""
+
+from __future__ import annotations
+
 import os
+import shutil
 import tempfile
-from io import StringIO
-from typing import List
+from pathlib import Path
+from textwrap import dedent
+from typing import List, Dict
+
+import streamlit as st
 from dotenv import load_dotenv
+from groq import Groq
+from sentence_transformers import SentenceTransformer
 
-# Load environment variables
-load_dotenv()
-
-# LangChain imports
+# LangChain
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 
-# Groq and Sentence Transformers
-from groq import Groq
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+# ────────────────────────────── ENV / CONFIG ───────────────────────────────────
+load_dotenv()  # reads .env
 
-# Configure Streamlit page
-st.set_page_config(
-    page_title="RAG PDF Chatbot",
-    page_icon="📚",
-    layout="wide"
-)
-
-st.title("📚 RAG PDF Chatbot")
-st.markdown("Upload PDFs and ask questions about their content!")
-
-# Initialize session state
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'vectorstore' not in st.session_state:
-    st.session_state.vectorstore = None
-if 'docs_processed' not in st.session_state:
-    st.session_state.docs_processed = False
-
-# Get API Key from environment
-groq_api_key = os.getenv("GROQ_API_KEY")
-
-if not groq_api_key:
-    st.error("❌ GROQ_API_KEY not found in environment variables. Please add it to your .env file.")
-    st.info("Create a .env file in your project root and add: GROQ_API_KEY=your_api_key_here")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("❌ GROQ_API_KEY not found in environment. "
+             "Create a `.env` file with GROQ_API_KEY=your_key_here")
     st.stop()
 
-# Initialize Groq client
-try:
-    groq_client = Groq(api_key=groq_api_key)
-    st.sidebar.success("✅ Groq API connected successfully")
-except Exception as e:
-    st.error(f"Error initializing Groq client: {str(e)}")
-    st.stop()
+st.set_page_config(page_title="RAG PDF Assistant",
+                   page_icon="📚",
+                   layout="wide")
 
-# Sidebar for document upload
-with st.sidebar:
-    st.header("📄 Document Upload")
-    uploaded_files = st.file_uploader(
-        "Choose PDF files",
-        type="pdf",
-        accept_multiple_files=True,
-        key="pdf_uploader"
+# ────────────────────────────── SESSION KEYS ───────────────────────────────────
+defaults = {
+    "vectorstore": None,
+    "docs_processed": False,
+    "messages": [],          # chat history
+    "quiz": [],              # generated quiz list
+    "quiz_generated": False
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ────────────────────────────── HELPERS ────────────────────────────────────────
+@st.cache_resource(show_spinner="📥 Loading sentence-transformer model…")
+def load_st_model() -> SentenceTransformer:
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+class STEmbeddings:               # minimal wrapper for LangChain
+    def __init__(self, model: SentenceTransformer):
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self.model.encode(texts).tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.model.encode([text]).tolist()[0]
+
+
+def build_vectorstore(files) -> Chroma:
+    """Load PDFs ➜ split ➜ embed ➜ return persistent Chroma store."""
+    model = load_st_model()
+    embeddings = STEmbeddings(model)
+
+    pages = []
+    for up_file in files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(up_file.getvalue())
+            loader = PyPDFLoader(tmp.name)
+            pages.extend(loader.load())
+        Path(tmp.name).unlink(missing_ok=True)
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs = splitter.split_documents(pages)
+
+    # fresh DB each run
+    db_path = Path("chroma_db")
+    if db_path.exists():
+        shutil.rmtree(db_path)
+
+    return Chroma.from_documents(docs, embeddings, persist_directory=str(db_path))
+
+
+def retrieve_context(query: str, k: int = 4) -> str:
+    """Fetch top-k relevant chunks and concatenate."""
+    retriever = st.session_state.vectorstore.as_retriever(
+        search_type="similarity", search_kwargs={"k": k}
     )
+    docs = retriever.invoke(query)
+    return "\n\n".join(d.page_content for d in docs)
 
-    if uploaded_files:
-        if st.button("Process Documents", type="primary"):
-            with st.spinner("Processing documents..."):
-                try:
-                    # Initialize components
-                    @st.cache_resource
-                    def load_sentence_transformer():
-                        return SentenceTransformer('all-MiniLM-L6-v2')
 
-                    embedding_model = load_sentence_transformer()
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-                    # Create a custom embedding function for Chroma
-                    class SentenceTransformerEmbeddings:
-                        def __init__(self, model):
-                            self.model = model
 
-                        def embed_documents(self, texts):
-                            return self.model.encode(texts).tolist()
+def call_groq(context: str, question: str,
+              max_tokens: int = 800, temp: float = 0.1) -> str:
+    prompt = (f"Answer the question using the context below. "
+              f"If the answer is not contained, say you don't know.\n\n"
+              f"Context:\n{context}\n\nQuestion: {question}")
+    resp = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model="llama-3.3-70b-versatile",
+        temperature=temp,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
 
-                        def embed_query(self, text):
-                            return self.model.encode([text]).tolist()[0]
 
-                    embeddings = SentenceTransformerEmbeddings(embedding_model)
+def generate_quiz() -> List[Dict[str, str]]:
+    """Return 20 question/answer dicts generated from the doc corpus."""
+    ctx = retrieve_context("overview of key points", k=60)
+    prompt = dedent(f"""
+        Create a 20-question quiz about the following document content.
+        For each item provide one question and its short answer.
+        Format exactly:
 
-                    # Process PDFs
-                    all_docs = []
-                    for uploaded_file in uploaded_files:
-                        # Save uploaded file temporarily
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                            tmp_file.write(uploaded_file.getvalue())
-                            tmp_file_path = tmp_file.name
+        Q: <question>
+        A: <answer>
+        ---
 
-                        # Load PDF
-                        loader = PyPDFLoader(tmp_file_path)
-                        docs = loader.load()
-                        all_docs.extend(docs)
+        Content:
+        {ctx}
+    """)
 
-                        # Clean up temp file
-                        os.unlink(tmp_file_path)
+    resp = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        temperature=0.3,
+        max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}],
+    ).choices[0].message.content
 
-                    # Split documents
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=200
-                    )
-                    split_docs = text_splitter.split_documents(all_docs)
+    qa_pairs = []
+    for block in resp.split("---"):
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        if len(lines) >= 2 and lines[0].startswith("Q:") and lines[1].startswith("A:"):
+            qa_pairs.append({
+                "question": lines[0][2:].strip(),
+                "answer": lines[1][2:].strip()
+            })
+    return qa_pairs[:20]
 
-                    # Create Chroma vector store
-                    persist_directory = "./chroma_db"
 
-                    # Remove existing directory if it exists
-                    import shutil
-                    if os.path.exists(persist_directory):
-                        shutil.rmtree(persist_directory)
+# ────────────────────────────── SIDEBAR ────────────────────────────────────────
+st.sidebar.header("📑 Document panel")
 
-                    vectorstore = Chroma.from_documents(
-                        documents=split_docs,
-                        embedding=embeddings,
-                        persist_directory=persist_directory
-                    )
+uploaded = st.sidebar.file_uploader("Upload PDF file(s)", type="pdf",
+                                    accept_multiple_files=True)
 
-                    st.session_state.vectorstore = vectorstore
-                    st.session_state.docs_processed = True
-                    st.success(f"Successfully processed {len(uploaded_files)} PDF(s) with {len(split_docs)} chunks!")
+feature = st.sidebar.selectbox("Choose feature",
+                               ("Chat", "Quiz", "Q&A"),
+                               index=0)
 
-                except Exception as e:
-                    st.error(f"Error processing documents: {str(e)}")
+if uploaded and st.sidebar.button("Process documents", use_container_width=True):
+    with st.spinner("🔧 Building vector store…"):
+        st.session_state.vectorstore = build_vectorstore(uploaded)
+        st.session_state.docs_processed = True
+        st.session_state.messages.clear()
+        st.session_state.quiz_generated = False
+        st.success("✅ Documents processed successfully!")
 
-# Main chat interface
-if st.session_state.docs_processed and st.session_state.vectorstore:
+# ────────────────────────────── MAIN LAYOUT ────────────────────────────────────
+st.title("📚 RAG PDF Assistant")
 
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+if not st.session_state.docs_processed:
+    st.info("➡️  Upload PDF(s) on the left and click *Process documents* to begin.")
+    st.stop()
 
-    # Chat input
-    if prompt := st.chat_input("Ask a question about your documents"):
-        # Add user message to chat history
+# 1️⃣ CHAT MODE ─────────────────────────────────────────────────────────────────
+if feature == "Chat":
+    st.subheader("💬 Chat with your documents")
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if prompt := st.chat_input("Ask anything about the documents"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generate response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    # Retrieve relevant documents
-                    retriever = st.session_state.vectorstore.as_retriever(
-                        search_type="similarity",
-                        search_kwargs={"k": 4}
-                    )
-                    relevant_docs = retriever.invoke(prompt)
+            with st.spinner("Thinking…"):
+                context = retrieve_context(prompt)
+                answer = call_groq(context, prompt)
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant",
+                                                  "content": answer})
 
-                    # Prepare context
-                    context = "\n\n".join([doc.page_content for doc in relevant_docs])
+# 2️⃣ Q&A MODE ─────────────────────────────────────────────────────────────────
+elif feature == "Q&A":
+    st.subheader("❓ Single question & answer")
+    q = st.text_input("Your question", placeholder="Type a question about the PDFs")
+    if st.button("Get answer") and q:
+        with st.spinner("Searching…"):
+            ctx = retrieve_context(q)
+            st.success(call_groq(ctx, q, max_tokens=400))
 
-                    # Create prompt template
-                    template = '''Answer the question based on the following context:
+# 3️⃣ QUIZ MODE ────────────────────────────────────────────────────────────────
+elif feature == "Quiz":
+    st.subheader("📝 20-question quiz generator")
+    if not st.session_state.quiz_generated:
+        if st.button("Generate quiz"):
+            with st.spinner("Creating quiz…"):
+                st.session_state.quiz = generate_quiz()
+                st.session_state.quiz_generated = True
 
-Context:
-{context}
+    if st.session_state.quiz_generated:
+        for i, qa in enumerate(st.session_state.quiz, start=1):
+            exp = st.expander(f"Q{i}: {qa['question']}", expanded=False)
+            exp.markdown(f"**Answer:** {qa['answer']}")
+        if st.button("Regenerate quiz"):
+            with st.spinner("Regenerating…"):
+                st.session_state.quiz = generate_quiz()
 
-Question: {question}
-
-Answer: Provide a detailed answer based on the context. If the answer is not in the context, say "I don't have enough information to answer this question."'''
-
-                    # Generate response using Groq
-                    chat_completion = groq_client.chat.completions.create(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": template.format(context=context, question=prompt)
-                            }
-                        ],
-                        model="llama-3.3-70b-versatile",
-                        temperature=0.1,
-                        max_tokens=1000
-                    )
-
-                    response = chat_completion.choices[0].message.content
-                    st.markdown(response)
-
-                    # Add assistant response to chat history
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-
-                except Exception as e:
-                    error_msg = f"Error generating response: {str(e)}"
-                    st.error(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-
-else:
-    st.info("👆 Please upload and process PDF documents to start chatting!")
-
-    # Show example usage
-    with st.expander("ℹ️ How to use this app"):
-        st.markdown('''
-        1. **Setup Environment**: Create a `.env` file with your Groq API key: `GROQ_API_KEY=your_api_key_here`
-        2. **Upload PDFs**: Select one or more PDF files using the file uploader
-        3. **Process Documents**: Click "Process Documents" to extract and index the content
-        4. **Ask Questions**: Once processed, you can ask questions about the content in the chat interface
-
-        **Features:**
-        - 🤖 Powered by Groq's fast LLM inference
-        - 🔍 Uses Sentence Transformers for embeddings
-        - 💾 Stores vectors in Chroma database
-        - 📝 Supports multiple PDF uploads
-        - 💬 Interactive chat interface
-        - 🔐 Secure API key management via environment variables
-        ''')
-
-# Footer
+# ────────────────────────────── FOOTER ────────────────────────────────────────
 st.markdown("---")
+
