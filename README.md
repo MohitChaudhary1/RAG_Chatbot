@@ -16,3 +16,4 @@ Features
 
 🔐 Environment Variables: Secure API key management via .env file
 
+<img width="1470" height="862" alt="Screenshot 2025-08-15 at 6 26 46 PM" src="https://github.com/user-attachments/assets/0a2d9588-da8a-4cc1-90e5-89d491aac2e9" />
